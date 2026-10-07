@@ -1,6 +1,7 @@
 package com.github.highcumontoa.modelservinggatewayjava;
 
 import com.github.highcumontoa.modelservinggatewayjava.batch.BatchProperties;
+import com.github.highcumontoa.modelservinggatewayjava.gateway.HealthProperties;
 import com.github.highcumontoa.modelservinggatewayjava.model.LinearScoringModel;
 import com.github.highcumontoa.modelservinggatewayjava.model.ModelRegistry;
 import jakarta.annotation.PostConstruct;
@@ -14,7 +15,7 @@ import java.util.Map;
  * 全部为本地确定性实现，不依赖外部服务或真实凭据。
  */
 @Configuration
-@EnableConfigurationProperties(BatchProperties.class)
+@EnableConfigurationProperties({BatchProperties.class, HealthProperties.class})
 public class GatewayConfiguration {
 
     private final ModelRegistry registry;

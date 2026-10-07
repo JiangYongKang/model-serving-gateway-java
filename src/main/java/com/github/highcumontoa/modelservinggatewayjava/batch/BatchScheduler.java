@@ -10,16 +10,19 @@ import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Supplier;
 
 /**
- * 批量调度器：
+ * 批量调度器（按版本一条车道，互不干扰）：
  * <ul>
- *   <li>并发请求在有限窗口（batchWindowMs）内合并为批量执行，降低单次调用开销；</li>
- *   <li>队列容量有界，溢出立即以 QUEUE_FULL 拒绝，不无限等待、不静默丢弃；</li>
+ *   <li>并发请求在有限窗口内合并为批量执行，降低单次调用开销；</li>
+ *   <li>承载参数来自 {@link Supplier} 快照：每次提交、每批形成各读取一次，
+ *       同一批判定看到同一套参数；运行中替换快照即生效，无需重启；</li>
+ *   <li>队列容量有界（按当前快照判定），溢出立即以 QUEUE_FULL 拒绝；</li>
  *   <li>排队等待超过 maxQueueWaitMs 的请求以 WAIT_TIMEOUT 拒绝；</li>
- *   <li>单批执行超过 executionTimeoutMs 时，未完成项以 EXECUTION_TIMEOUT 异常完成，
- *       由上层决定降级策略。</li>
+ *   <li>单批执行超过 executionTimeoutMs 时，未完成项以 EXECUTION_TIMEOUT 异常完成。</li>
  * </ul>
  */
 public class BatchScheduler<T, R> {
@@ -59,48 +62,71 @@ public class BatchScheduler<T, R> {
         void execute(Batch<T, R> batch);
     }
 
-    private final BatchProperties properties;
+    private final String name;
+    private final Supplier<VersionCapacity> capacity;
     private final BatchExecutor<T, R> executor;
-    private final LinkedBlockingQueue<BatchItem<T, R>> queue;
+    private final LinkedBlockingQueue<BatchItem<T, R>> queue = new LinkedBlockingQueue<>();
+    private final AtomicInteger queueDepth = new AtomicInteger();
+    private final AtomicInteger inFlight = new AtomicInteger();
     private final AtomicLong batchSeq = new AtomicLong();
     private final Thread dispatcher;
     private volatile boolean running = true;
 
-    public BatchScheduler(BatchProperties properties, BatchExecutor<T, R> executor) {
-        this.properties = properties;
+    public BatchScheduler(String name, Supplier<VersionCapacity> capacity,
+                          BatchExecutor<T, R> executor) {
+        this.name = name;
+        this.capacity = capacity;
         this.executor = executor;
-        this.queue = new LinkedBlockingQueue<>(properties.getQueueCapacity());
         this.dispatcher = Thread.ofVirtual()
-                .name("batch-dispatcher")
+                .name(name + "-dispatcher")
                 .start(this::dispatchLoop);
     }
 
     /**
-     * 提交请求。队列已满时立即以 QUEUE_FULL 异常完成返回的 future，
-     * 调用方不会无限阻塞。
+     * 提交请求。按提交时的容量快照判定，队列已满立即以 QUEUE_FULL
+     * 异常完成返回的 future，调用方不会无限阻塞。
      */
     public CompletableFuture<R> submit(T item) {
         CompletableFuture<R> future = new CompletableFuture<>();
-        BatchItem<T, R> pending = new BatchItem<>(item, future, System.nanoTime());
-        if (!running || !queue.offer(pending)) {
+        VersionCapacity cap = capacity.get();
+        int depth = queueDepth.incrementAndGet();
+        if (!running || depth > cap.queueCapacity()) {
+            queueDepth.decrementAndGet();
             future.completeExceptionally(
                     new GatewayException(RejectReason.QUEUE_FULL,
-                            "queue capacity " + properties.getQueueCapacity() + " exceeded"));
+                            "lane " + name + " queue capacity " + cap.queueCapacity()
+                                    + " exceeded"));
+            return future;
         }
+        queue.offer(new BatchItem<>(item, future, System.nanoTime()));
         return future;
+    }
+
+    /** 当前排队深度（gauge，观测用）。 */
+    public int queueDepth() {
+        return queueDepth.get();
+    }
+
+    /** 当前正在执行的请求数（gauge，观测用）。 */
+    public int inFlight() {
+        return inFlight.get();
     }
 
     private void dispatchLoop() {
         while (running) {
             try {
                 BatchItem<T, R> first = queue.take();
+                queueDepth.decrementAndGet();
+                // 每批形成时读取一次容量快照：本批的窗口/批量/等待/超时判定
+                // 全部使用同一套参数，不受运行中调整影响
+                VersionCapacity cap = capacity.get();
                 List<BatchItem<T, R>> items = new ArrayList<>();
-                if (!acceptOrReject(first, items)) {
+                if (!acceptOrReject(first, items, cap)) {
                     continue;
                 }
                 long deadline = System.nanoTime()
-                        + TimeUnit.MILLISECONDS.toNanos(properties.getBatchWindowMs());
-                while (items.size() < properties.getMaxBatchSize()) {
+                        + TimeUnit.MILLISECONDS.toNanos(cap.batchWindowMs());
+                while (items.size() < cap.maxBatchSize()) {
                     long remaining = deadline - System.nanoTime();
                     if (remaining <= 0) {
                         break;
@@ -109,9 +135,10 @@ public class BatchScheduler<T, R> {
                     if (next == null) {
                         break;
                     }
-                    acceptOrReject(next, items);
+                    queueDepth.decrementAndGet();
+                    acceptOrReject(next, items, cap);
                 }
-                runBatch(items);
+                runBatch(items, cap);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 return;
@@ -120,21 +147,24 @@ public class BatchScheduler<T, R> {
     }
 
     /** 等待超时的请求以 WAIT_TIMEOUT 拒绝，不进入批次。 */
-    private boolean acceptOrReject(BatchItem<T, R> pending, List<BatchItem<T, R>> items) {
+    private boolean acceptOrReject(BatchItem<T, R> pending, List<BatchItem<T, R>> items,
+                                   VersionCapacity cap) {
         long waitedMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - pending.enqueuedAtNanos());
-        if (waitedMs > properties.getMaxQueueWaitMs()) {
+        if (waitedMs > cap.maxQueueWaitMs()) {
             pending.future().completeExceptionally(
                     new GatewayException(RejectReason.WAIT_TIMEOUT,
-                            "waited " + waitedMs + "ms > limit " + properties.getMaxQueueWaitMs() + "ms"));
+                            "lane " + name + " waited " + waitedMs + "ms > limit "
+                                    + cap.maxQueueWaitMs() + "ms"));
             return false;
         }
         items.add(pending);
         return true;
     }
 
-    private void runBatch(List<BatchItem<T, R>> items) {
-        String batchId = "batch-" + batchSeq.incrementAndGet();
+    private void runBatch(List<BatchItem<T, R>> items, VersionCapacity cap) {
+        String batchId = name + "-batch-" + batchSeq.incrementAndGet();
         Batch<T, R> batch = new Batch<>(batchId, List.copyOf(items));
+        inFlight.addAndGet(items.size());
         log.info("forming batch id={} size={} items={}", batchId, batch.size(),
                 items.stream().map(i -> i.item().toString()).toList());
         // 在独立虚拟线程中执行，dispatcher 以超时等待，避免单个慢批次卡死调度
@@ -152,7 +182,7 @@ public class BatchScheduler<T, R> {
                     .map(BatchItem::future)
                     .toArray(CompletableFuture[]::new);
             CompletableFuture.allOf(futures)
-                    .get(properties.getExecutionTimeoutMs(), TimeUnit.MILLISECONDS);
+                    .get(cap.executionTimeoutMs(), TimeUnit.MILLISECONDS);
         } catch (java.util.concurrent.TimeoutException e) {
             // 先以 EXECUTION_TIMEOUT 完成所有未完成项，再中断执行线程，
             // 避免被中断的模型抢先写入正常结果（complete 只会生效一次）
@@ -160,13 +190,15 @@ public class BatchScheduler<T, R> {
                 item.future().completeExceptionally(
                         new GatewayException(RejectReason.EXECUTION_TIMEOUT,
                                 "batch " + batchId + " exceeded "
-                                        + properties.getExecutionTimeoutMs() + "ms"));
+                                        + cap.executionTimeoutMs() + "ms"));
             }
             execThread.interrupt();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (java.util.concurrent.ExecutionException ignored) {
             // 个别 item 异常完成属正常路径，由调用方处理
+        } finally {
+            inFlight.addAndGet(-items.size());
         }
     }
 

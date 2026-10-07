@@ -35,7 +35,7 @@
   "score": 0.7941,
   "label": "PASS",
   "reason": "NONE",
-  "batchId": "batch-3",
+  "batchId": "lane-v1-batch-3",
   "batchSize": 4
 }
 ```
@@ -50,9 +50,13 @@
 - `GET /api/v1/models`：当前在线模型版本列表。
 - `GET /api/v1/degradations`：降级事件查询（requestId、版本、原因、明细、时间）。
 
-## 批量调度与过载控制
+## 批量调度与过载控制（按版本车道）
 
-并发请求在有限窗口内合并为批量执行，降低单次调用开销。参数（`application.properties`）：
+**每个模型版本一条独立调度车道**：独立队列、独立调度线程、独立批次。
+一个版本变慢或积压，不会占用其他版本的队列与调度资源，
+健康版本的请求不会被连累拒绝或超时。
+
+并发请求在有限窗口内合并为批量执行。全局默认参数（`application.properties`）：
 
 | 配置 | 默认 | 含义 |
 | --- | --- | --- |
@@ -67,6 +71,74 @@
 - 队列已满 → `QUEUE_FULL`（HTTP 429）
 - 排队等待超过上限 → `WAIT_TIMEOUT`（HTTP 429）
 
+## 按版本容量治理（运行中可调）
+
+每个版本可在全局默认之上单独配置自己的承载参数，且**运行中调整即生效**：
+不重启服务、不打断在途请求。调整以整体快照原子替换：
+每次提交、每一批的形成各自读取一次快照，**同一批判定看到同一套参数**，
+不会出现一半按旧值一半按新值的结果。
+
+- `GET /api/v1/versions/{version}/capacity`：查询该版本当前生效的承载参数。
+- `PUT /api/v1/versions/{version}/capacity`：整体替换该版本承载参数，立即对新提交/新批次生效。
+
+```bash
+curl -s -X PUT localhost:8080/api/v1/versions/v1/capacity \
+  -H 'Content-Type: application/json' \
+  -d '{"maxBatchSize":4,"batchWindowMs":10,"queueCapacity":32,
+       "maxQueueWaitMs":100,"executionTimeoutMs":300}'
+```
+
+参数必须全部为正数，否则返回 400 且不生效。未单独配置的版本使用全局默认。
+
+## 版本健康状态（受控与自动恢复）
+
+每个版本独立运行一个健康状态机（熔断式），互不影响：
+
+| 状态 | 行为 |
+| --- | --- |
+| `HEALTHY` | 正常接纳；连续失败/过载（执行超时、内部异常、结果不可用、队列溢出、排队超时）达到阈值 → `UNHEALTHY` |
+| `UNHEALTHY` | 受控状态：不再无意义堆积排队，新请求立即以 `VERSION_UNHEALTHY` 拒绝（HTTP 503）；冷却期从进入时刻起算、固定不变 |
+| `HALF_OPEN` | 冷却到期自动进入：放行有限个试探请求；试探成功 → `HEALTHY`（计数清零，自动恢复，无需人工重启）；试探失败 → 回到 `UNHEALTHY` 并重新起算冷却期 |
+
+`VERSION_UNHEALTHY` 是独立的拒绝原因，与普通过载拒绝（`QUEUE_FULL`/`WAIT_TIMEOUT`）、
+普通超时/异常降级（`EXECUTION_TIMEOUT`/`INTERNAL_ERROR`）严格区分。
+状态迁移只依赖计数器与单调时钟，判定确定、可复现。
+
+健康判定配置（`application.properties`）：
+
+| 配置 | 默认 | 含义 |
+| --- | --- | --- |
+| `gateway.health.failure-threshold` | 3 | 连续失败/过载达到该次数即判定不健康 |
+| `gateway.health.cooldown-ms` | 5000 | 不健康冷却期（毫秒），到期进入半开试探 |
+| `gateway.health.half-open-probe-count` | 1 | 半开状态允许的并发试探请求数 |
+
+## 运行观测（按版本）
+
+- `GET /api/v1/versions/{version}/stats`：单版本运行状态。
+- `GET /api/v1/versions/stats`：全部已观测版本。
+- `POST /api/v1/versions/{version}/stats/reset` / `POST /api/v1/versions/stats/reset`：
+  重置累计计数（压测用）。
+
+```json
+{
+  "modelVersion": "v1",
+  "healthState": "UNHEALTHY",
+  "retryAfterMs": 3200,
+  "queueDepth": 0,
+  "inFlight": 0,
+  "okCount": 41,
+  "rejected": {"QUEUE_FULL": 5, "VERSION_UNHEALTHY": 12},
+  "degraded": {"EXECUTION_TIMEOUT": 3}
+}
+```
+
+- `queueDepth`/`inFlight`：实时 gauge（当前排队深度、正在处理数量）。
+- `okCount`/`rejected`/`degraded`：累计计数，可按原因区分，可重置。
+- `healthState` + `retryAfterMs`：健康状态；不健康时给出距重新尝试接纳的剩余毫秒数。
+
+查询与重置只读/只清计数器，**不干扰正常调度，不改变任何在途请求的判定结果**；
+重置只清累计计数，不影响实时 gauge。
+
 ## 版本路由与兼容规则
 
 严格按 `modelVersion` 路由到对应本地实现，**绝不静默回退默认版本**：
@@ -77,6 +149,8 @@
 | 版本不存在 | `VERSION_UNKNOWN` | 404 |
 | 版本已下线 | `VERSION_RETIRED` | 410 |
 | 契约版本不匹配 / 特征缺失 | `CONTRACT_INCOMPATIBLE` | 400 |
+| 队列已满 / 排队超时 | `QUEUE_FULL` / `WAIT_TIMEOUT` | 429 |
+| 版本不健康（受控快速失败） | `VERSION_UNHEALTHY` | 503 |
 
 内置版本：`v1`（契约 1）、`v2`（契约 2，与 v1 不兼容）、`v0`（已下线）。
 模型为确定性线性打分（`score = sigmoid(bias + Σ wᵢxᵢ)`），权重固定、无随机性，
@@ -97,10 +171,19 @@
 不污染正常结论（同批/同时段其他请求的正常结果不受影响）。
 每次降级写入 `DegradationLog`，可通过 `GET /api/v1/degradations` 查询原因。
 
+## 兼容范围
+
+- 请求/响应协议字段保持不变；`reason` 仅**新增**枚举值 `VERSION_UNHEALTHY`，
+  既有取值与含义不变，调用方按既有 reason 分支处理的行为不受影响。
+- 既有拒绝（路由类、过载类）与降级（超时、异常、结果不可用）的触发条件与结论格式不变。
+- 新增端点（容量治理、运行观测）全部为只读查询或整体替换式更新，
+  不改变评分入口的判定语义。
+
 ## 本地验证
 
 ```bash
-# 全部测试（并发批量、过载拒绝、版本兼容、降级、可复现性、HTTP 协议）
+# 全部测试（并发批量、过载拒绝、版本兼容、降级、版本隔离、
+# 运行中调参、健康进入与自动恢复、状态查询与重置、HTTP 协议）
 mvn test
 
 # 启动服务（server.port=0 表示随机端口，可改为固定端口）
@@ -113,7 +196,17 @@ curl -s -X POST localhost:8080/api/v1/score \
        "features":{"income":2.0,"debt":0.5}}'
 curl -s localhost:8080/api/v1/models
 curl -s localhost:8080/api/v1/degradations
+
+# 容量治理与观测
+curl -s localhost:8080/api/v1/versions/v1/capacity
+curl -s -X PUT localhost:8080/api/v1/versions/v1/capacity \
+  -H 'Content-Type: application/json' \
+  -d '{"maxBatchSize":4,"batchWindowMs":10,"queueCapacity":32,
+       "maxQueueWaitMs":100,"executionTimeoutMs":300}'
+curl -s localhost:8080/api/v1/versions/v1/stats
+curl -s -X POST localhost:8080/api/v1/versions/v1/stats/reset
 ```
 
-测试日志会打印请求、批次分组（batchId/batchSize）与判定依据
-（status/score/label/reason），便于人工核对行为。
+测试日志会打印请求、批次分组（batchId/batchSize）、判定依据
+（status/score/label/reason）、健康状态迁移与各用例覆盖的业务点，
+便于人工核对行为。
