@@ -9,6 +9,8 @@ public enum RejectReason {
     CONTRACT_INCOMPATIBLE,
     QUEUE_FULL,
     WAIT_TIMEOUT,
+    /** 版本持续过载/失败被判定为不健康，进入受控状态后的快速拒绝。 */
+    VERSION_UNHEALTHY,
     EXECUTION_TIMEOUT,
     INTERNAL_ERROR,
     RESULT_UNAVAILABLE

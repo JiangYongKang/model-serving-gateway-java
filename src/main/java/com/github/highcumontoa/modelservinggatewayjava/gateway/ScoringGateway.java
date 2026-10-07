@@ -6,11 +6,15 @@ import com.github.highcumontoa.modelservinggatewayjava.api.ScoreRequest;
 import com.github.highcumontoa.modelservinggatewayjava.api.ScoreResponse;
 import com.github.highcumontoa.modelservinggatewayjava.batch.BatchProperties;
 import com.github.highcumontoa.modelservinggatewayjava.batch.BatchScheduler;
+import com.github.highcumontoa.modelservinggatewayjava.governance.CapacityProperties;
+import com.github.highcumontoa.modelservinggatewayjava.governance.GovernorRegistry;
+import com.github.highcumontoa.modelservinggatewayjava.governance.VersionGovernor;
 import com.github.highcumontoa.modelservinggatewayjava.model.LocalModel;
 import com.github.highcumontoa.modelservinggatewayjava.model.ModelRegistry;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.time.Instant;
@@ -21,7 +25,11 @@ import java.util.concurrent.CompletionException;
  * <ol>
  *   <li>版本路由：严格按请求版本选择本地实现，缺失/未知/已下线/契约不兼容
  *       一律返回可区分的 REJECTED，绝不静默回退默认版本；</li>
- *   <li>批量执行：通过 {@link BatchScheduler} 在有限窗口内合批；</li>
+ *   <li>按版本容量治理：每个版本经 {@link GovernorRegistry} 获得独立的
+ *       批量调度器、承载参数快照、健康状态机与计数，版本之间互不影响；
+ *       参数可在运行中调整，同一批的判定看到同一套参数；</li>
+ *   <li>健康受控：版本持续过载/失败被判定不健康后快速拒绝
+ *       （VERSION_UNHEALTHY，与普通过载拒绝可区分），恢复后自动重新接纳；</li>
  *   <li>降级策略：执行超时、内部异常、结果不可用（NaN/Inf）时，
  *       返回确定性的中性先验分 0.5 + 标签 FALLBACK，状态 DEGRADED，
  *       与正常结论（PASS/FAIL）严格区分，并写入 {@link DegradationLog} 供查询。</li>
@@ -37,13 +45,21 @@ public class ScoringGateway {
 
     private final ModelRegistry registry;
     private final DegradationLog degradationLog;
-    private final BatchScheduler<ScoreRequest, ScoreResponse> scheduler;
+    private final GovernorRegistry governors;
 
+    @Autowired
     public ScoringGateway(ModelRegistry registry, DegradationLog degradationLog,
-                          BatchProperties properties) {
+                          GovernorRegistry governors) {
         this.registry = registry;
         this.degradationLog = degradationLog;
-        this.scheduler = new BatchScheduler<>(properties, this::executeBatch);
+        this.governors = governors;
+    }
+
+    /** 便于测试直接装配：使用默认容量治理配置。 */
+    public ScoringGateway(ModelRegistry registry, DegradationLog degradationLog,
+                          BatchProperties properties) {
+        this(registry, degradationLog,
+                new GovernorRegistry(properties, new CapacityProperties()));
     }
 
     public ScoreResponse score(ScoreRequest request) {
@@ -55,16 +71,25 @@ public class ScoringGateway {
                     request.requestId(), routingError.reason());
             return routingError;
         }
-        // 2. 进入批量调度
+        // 2. 进入该版本独立的批量调度（版本之间互不影响）
+        VersionGovernor governor = governors.governorFor(request.modelVersion(),
+                this::executeBatch);
+        ScoreResponse response;
         try {
-            ScoreResponse response = scheduler.submit(request).join();
-            log.info("decision: requestId={} status={} score={} label={} reason={} batch={}/{}",
-                    response.requestId(), response.status(), response.score(),
-                    response.label(), response.reason(), response.batchId(), response.batchSize());
-            return response;
+            response = schedulerJoin(governor, request);
         } catch (CompletionException e) {
-            return handleSchedulerFailure(request, e.getCause());
+            response = handleSchedulerFailure(request, e.getCause());
         }
+        // 3. 记录结论：驱动分类计数与健康状态机
+        governor.recordOutcome(response);
+        log.info("decision: requestId={} status={} score={} label={} reason={} batch={}/{}",
+                response.requestId(), response.status(), response.score(),
+                response.label(), response.reason(), response.batchId(), response.batchSize());
+        return response;
+    }
+
+    private ScoreResponse schedulerJoin(VersionGovernor governor, ScoreRequest request) {
+        return governor.submit(request).join();
     }
 
     /** 版本路由校验：任何不满足都返回可区分原因的 REJECTED。 */
@@ -121,11 +146,11 @@ public class ScoringGateway {
         }
     }
 
-    /** 调度层失败：过载类原因拒绝，超时类原因降级。 */
+    /** 调度层失败：过载类与不健康快速拒绝原样拒绝，超时类原因降级。 */
     private ScoreResponse handleSchedulerFailure(ScoreRequest request, Throwable cause) {
         if (cause instanceof GatewayException ge) {
             return switch (ge.reason()) {
-                case QUEUE_FULL, WAIT_TIMEOUT -> {
+                case QUEUE_FULL, WAIT_TIMEOUT, VERSION_UNHEALTHY -> {
                     log.info("request rejected by scheduler: requestId={} reason={} detail={}",
                             request.requestId(), ge.reason(), ge.getMessage());
                     yield ScoreResponse.rejected(request.requestId(), request.modelVersion(),
@@ -151,6 +176,6 @@ public class ScoringGateway {
 
     @PreDestroy
     public void shutdown() {
-        scheduler.shutdown();
+        governors.shutdownAll();
     }
 }

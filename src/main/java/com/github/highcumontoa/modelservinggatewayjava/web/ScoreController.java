@@ -62,6 +62,7 @@ public class ScoreController {
         }
         return switch (response.reason()) {
             case QUEUE_FULL, WAIT_TIMEOUT -> HttpStatus.TOO_MANY_REQUESTS;
+            case VERSION_UNHEALTHY -> HttpStatus.SERVICE_UNAVAILABLE;
             case VERSION_MISSING, CONTRACT_INCOMPATIBLE -> HttpStatus.BAD_REQUEST;
             case VERSION_UNKNOWN -> HttpStatus.NOT_FOUND;
             case VERSION_RETIRED -> HttpStatus.GONE;

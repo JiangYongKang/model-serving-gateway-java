@@ -1,6 +1,7 @@
 package com.github.highcumontoa.modelservinggatewayjava;
 
 import com.github.highcumontoa.modelservinggatewayjava.batch.BatchProperties;
+import com.github.highcumontoa.modelservinggatewayjava.governance.CapacityProperties;
 import com.github.highcumontoa.modelservinggatewayjava.model.LinearScoringModel;
 import com.github.highcumontoa.modelservinggatewayjava.model.ModelRegistry;
 import jakarta.annotation.PostConstruct;
@@ -10,11 +11,11 @@ import org.springframework.context.annotation.Configuration;
 import java.util.Map;
 
 /**
- * 网关装配：启用批量配置，并注册内置本地模型版本。
+ * 网关装配：启用批量配置与按版本容量治理配置，并注册内置本地模型版本。
  * 全部为本地确定性实现，不依赖外部服务或真实凭据。
  */
 @Configuration
-@EnableConfigurationProperties(BatchProperties.class)
+@EnableConfigurationProperties({BatchProperties.class, CapacityProperties.class})
 public class GatewayConfiguration {
 
     private final ModelRegistry registry;
